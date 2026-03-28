@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "feishu": {
+      "command": "bun",
+      "args": ["server.ts"],
+      "cwd": "${pluginDir}"
+    }
+  }
+}

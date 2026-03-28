@@ -1,4 +1,15 @@
-# /feishu:setup — Interactive Feishu app setup guide
+---
+name: setup
+description: Walk through creating a Feishu bot app from scratch — interactive guide for the Feishu Developer Console. Use when the user asks how to create a Feishu bot, set up the app, or needs help with the developer console.
+user-invocable: true
+allowed-tools:
+  - Read
+  - Write
+  - Bash(ls *)
+  - Bash(mkdir *)
+---
+
+# /feishu:setup — Interactive Feishu App Setup Guide
 
 Walk through creating and configuring a Feishu bot app from scratch.
 

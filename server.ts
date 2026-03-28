@@ -393,6 +393,17 @@ type AttachmentMeta = {
 // ── Image/file detection ──────────────────────────────────────────────────────
 const IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp'])
 
+// ── Download helper ──────────────────────────────────────────────────────────
+// The lark SDK's messageResource.get() returns { writeFile, getReadableStream }.
+// Use writeFile for simplicity — it writes directly to disk.
+async function downloadResource(msgId: string, fileKey: string, type: string, destPath: string): Promise<void> {
+  const res = await feishu.im.messageResource.get({
+    path: { message_id: msgId, file_key: fileKey },
+    params: { type },
+  })
+  await res.writeFile(destPath)
+}
+
 // ── Feishu client ─────────────────────────────────────────────────────────────
 const feishu = new lark.Client({
   appId,
@@ -550,6 +561,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           chat_id: { type: 'string' },
           message_id: { type: 'string' },
           text: { type: 'string' },
+          format: {
+            type: 'string',
+            enum: ['text', 'richtext'],
+            description: "Rendering mode. 'text' = plain text. 'richtext' = Feishu rich text (post). Default: 'text'.",
+          },
         },
         required: ['chat_id', 'message_id', 'text'],
       },
@@ -567,6 +583,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const text = args.text as string
         const reply_to = args.reply_to as string | undefined
         const files = (args.files as string[] | undefined) ?? []
+        const format = (args.format as string | undefined) ?? 'text'
 
         assertAllowedChat(chat_id)
 
@@ -579,26 +596,44 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
 
         const access = loadAccess()
-        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
-        const mode = access.chunkMode ?? 'length'
         const replyMode = access.replyToMode ?? 'first'
-        const chunks = chunk(text, limit, mode)
         const sentIds: string[] = []
 
-        try {
-          for (let i = 0; i < chunks.length; i++) {
-            const shouldReplyTo =
-              reply_to != null &&
-              replyMode !== 'off' &&
-              (replyMode === 'all' || i === 0)
-            const msgId = await sendMessage(chat_id, chunks[i], shouldReplyTo ? reply_to : undefined)
-            sentIds.push(msgId)
+        if (format === 'richtext') {
+          // Feishu rich text (post) format — wrap each line as a text element.
+          const lines = text.split('\n')
+          const content = lines.map(line => [{ tag: 'text', text: line }])
+          const res = await feishu.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chat_id,
+              msg_type: 'post',
+              content: JSON.stringify({ zh_cn: { title: '', content } }),
+              ...(reply_to && replyMode !== 'off' ? { root_id: reply_to } : {}),
+            },
+          })
+          if (res.code !== 0) throw new Error(`Feishu API error ${res.code}: ${res.msg}`)
+          sentIds.push(res.data?.message_id ?? '')
+        } else {
+          const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+          const mode = access.chunkMode ?? 'length'
+          const chunks = chunk(text, limit, mode)
+
+          try {
+            for (let i = 0; i < chunks.length; i++) {
+              const shouldReplyTo =
+                reply_to != null &&
+                replyMode !== 'off' &&
+                (replyMode === 'all' || i === 0)
+              const msgId = await sendMessage(chat_id, chunks[i], shouldReplyTo ? reply_to : undefined)
+              sentIds.push(msgId)
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            throw new Error(
+              `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
+            )
           }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          throw new Error(
-            `reply failed after ${sentIds.length} of ${chunks.length} chunk(s) sent: ${msg}`,
-          )
         }
 
         // Files go as separate messages (Feishu doesn't mix text+file in one call).
@@ -633,7 +668,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               data: {
                 file_type: 'stream',
                 file_name: fileName,
-                stream: readFileSync(f),
+                file: readFileSync(f),
               },
             })
             if (uploadRes.code !== 0) throw new Error(`file upload failed: ${uploadRes.msg}`)
@@ -678,39 +713,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const [message_id, file_key, fileType] = parts
         const type = fileType === 'image' ? 'image' : 'file'
 
-        const res = await feishu.im.messageResource.get({
-          path: { message_id: message_id!, file_key: file_key! },
-          params: { type: type as 'image' | 'file' },
-        })
-
-        // The response is a readable stream / buffer from the lark SDK
         const rawExt = type === 'image' ? 'jpg' : 'bin'
         const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
         const safeKey = (file_key ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
         const path = join(INBOX_DIR, `${Date.now()}-${safeKey}.${ext}`)
         mkdirSync(INBOX_DIR, { recursive: true })
-
-        // lark SDK returns the raw response — handle both Buffer and ReadableStream
-        let buf: Buffer
-        if (Buffer.isBuffer(res)) {
-          buf = res
-        } else if (res && typeof (res as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer === 'function') {
-          buf = Buffer.from(await (res as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer())
-        } else {
-          // Fallback: try to stringify whatever we got
-          buf = Buffer.from(String(res))
-        }
-        writeFileSync(path, buf)
+        await downloadResource(message_id!, file_key!, type, path)
         return { content: [{ type: 'text', text: path }] }
       }
 
       case 'edit_message': {
         assertAllowedChat(args.chat_id as string)
-        const res = await feishu.im.message.patch({
+        const editFormat = (args.format as string | undefined) ?? 'text'
+        let editMsgType: string
+        let editContent: string
+        if (editFormat === 'richtext') {
+          editMsgType = 'post'
+          const lines = (args.text as string).split('\n')
+          const content = lines.map(line => [{ tag: 'text', text: line }])
+          editContent = JSON.stringify({ zh_cn: { title: '', content } })
+        } else {
+          editMsgType = 'text'
+          editContent = JSON.stringify({ text: args.text as string })
+        }
+        const res = await feishu.im.message.update({
           path: { message_id: args.message_id as string },
           data: {
-            content: JSON.stringify({ text: args.text as string }),
-            msg_type: 'text',
+            msg_type: editMsgType,
+            content: editContent,
           },
         })
         if (res.code !== 0) throw new Error(`Feishu API error ${res.code}: ${res.msg}`)
@@ -742,8 +772,8 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('feishu channel: shutting down\n')
+  // Force-exit after 2s — WSClient has no clean stop() API.
   setTimeout(() => process.exit(0), 2000)
-  process.exit(0)
 }
 process.stdin.on('end', shutdown)
 process.stdin.on('close', shutdown)
@@ -797,6 +827,7 @@ async function handleInbound(
         behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
       },
     })
+    pendingPermissions.delete(permMatch[2]!.toLowerCase())
     // React to the permission reply
     const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? 'OK' : 'THUMBSDOWN'
     void feishu.im.messageReaction.create({
@@ -865,129 +896,129 @@ type FeishuMessageEvent = {
   }
 }
 
-wsClient.start({
+void wsClient.start({
   eventDispatcher: new lark.EventDispatcher({}).register({
     'im.message.receive_v1': async (data: FeishuMessageEvent) => {
-      const { message, sender } = data
-      const senderId = sender.sender_id?.open_id ?? ''
-      const chatId = message.chat_id ?? ''
-      const chatType = (message.chat_type as 'p2p' | 'group') ?? 'p2p'
-      const msgId = message.message_id ?? ''
-      const ts = message.create_time
-        ? new Date(Number(message.create_time)).toISOString()
-        : new Date().toISOString()
-
-      if (!senderId || !chatId) return
-
-      let text = ''
-      let imagePath: string | undefined
-      let attachment: AttachmentMeta | undefined
-      const mentions: FeishuMention[] = message.mentions ?? []
-
-      let parsedContent: Record<string, unknown> = {}
       try {
-        parsedContent = JSON.parse(message.content) as Record<string, unknown>
-      } catch {
-        return
-      }
+        const { message, sender } = data
+        const senderId = sender.sender_id?.open_id ?? ''
+        const chatId = message.chat_id ?? ''
+        const chatType = (message.chat_type as 'p2p' | 'group') ?? 'p2p'
+        const msgId = message.message_id ?? ''
+        const ts = message.create_time
+          ? new Date(Number(message.create_time)).toISOString()
+          : new Date().toISOString()
 
-      switch (message.message_type) {
-        case 'text': {
-          // Strip @_user_xxx mention placeholders that Feishu injects
-          text = ((parsedContent['text'] as string | undefined) ?? '')
-            .replace(/@_user_\w+/g, '')
-            .trim()
-          break
-        }
-        case 'image': {
-          const imageKey = parsedContent['image_key'] as string | undefined
-          if (!imageKey) return
-          // Download immediately (photos auto-download like Telegram's photo handler)
-          try {
-            const res = await feishu.im.messageResource.get({
-              path: { message_id: msgId, file_key: imageKey },
-              params: { type: 'image' },
-            })
-            const path = join(INBOX_DIR, `${Date.now()}-${imageKey}.jpg`)
-            mkdirSync(INBOX_DIR, { recursive: true })
-            let buf: Buffer
-            if (Buffer.isBuffer(res)) {
-              buf = res
-            } else if (res && typeof (res as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer === 'function') {
-              buf = Buffer.from(await (res as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer())
-            } else {
-              buf = Buffer.from(String(res))
-            }
-            writeFileSync(path, buf)
-            imagePath = path
-            text = '(photo)'
-          } catch (err) {
-            process.stderr.write(`feishu channel: image download failed: ${err}\n`)
-            // Fall back to attachment_file_id
-            text = '(photo)'
-            attachment = { kind: 'image', file_id: `${msgId}:${imageKey}:image` }
-          }
-          break
-        }
-        case 'file': {
-          const fileKey = parsedContent['file_key'] as string | undefined
-          const fileName = parsedContent['file_name'] as string | undefined
-          if (!fileKey) return
-          text = `(file: ${safeName(fileName) ?? 'file'})`
-          attachment = { kind: 'file', file_id: `${msgId}:${fileKey}:file`, name: safeName(fileName) }
-          break
-        }
-        case 'audio': {
-          const fileKey = parsedContent['file_key'] as string | undefined
-          if (!fileKey) return
-          text = '(voice message)'
-          attachment = { kind: 'audio', file_id: `${msgId}:${fileKey}:file` }
-          break
-        }
-        case 'media': {
-          // video
-          const fileKey = parsedContent['file_key'] as string | undefined
-          const fileName = parsedContent['file_name'] as string | undefined
-          if (!fileKey) return
-          text = '(video)'
-          attachment = { kind: 'video', file_id: `${msgId}:${fileKey}:file`, name: safeName(fileName) }
-          break
-        }
-        case 'sticker': {
-          text = '(sticker)'
-          break
-        }
-        case 'post': {
-          // Rich text
-          text = extractRichText(parsedContent as Record<string, RichTextLang>)
-          if (!text) text = '(rich text message)'
-          break
-        }
-        default:
+        if (!senderId || !chatId) return
+
+        let text = ''
+        let imagePath: string | undefined
+        let attachment: AttachmentMeta | undefined
+        const mentions: FeishuMention[] = message.mentions ?? []
+
+        let parsedContent: Record<string, unknown> = {}
+        try {
+          parsedContent = JSON.parse(message.content) as Record<string, unknown>
+        } catch {
           return
-      }
+        }
 
-      await handleInbound(senderId, chatId, chatType, msgId, ts, text, mentions, imagePath, attachment)
+        switch (message.message_type) {
+          case 'text': {
+            // Strip @_user_xxx mention placeholders that Feishu injects
+            text = ((parsedContent['text'] as string | undefined) ?? '')
+              .replace(/@_user_\w+/g, '')
+              .trim()
+            break
+          }
+          case 'image': {
+            const imageKey = parsedContent['image_key'] as string | undefined
+            if (!imageKey) return
+            // Download immediately (photos auto-download like Telegram's photo handler)
+            try {
+              const path = join(INBOX_DIR, `${Date.now()}-${imageKey}.jpg`)
+              mkdirSync(INBOX_DIR, { recursive: true })
+              await downloadResource(msgId, imageKey, 'image', path)
+              imagePath = path
+              text = '(photo)'
+            } catch (err) {
+              process.stderr.write(`feishu channel: image download failed: ${err}\n`)
+              // Fall back to attachment_file_id
+              text = '(photo)'
+              attachment = { kind: 'image', file_id: `${msgId}:${imageKey}:image` }
+            }
+            break
+          }
+          case 'file': {
+            const fileKey = parsedContent['file_key'] as string | undefined
+            const fileName = parsedContent['file_name'] as string | undefined
+            if (!fileKey) return
+            text = `(file: ${safeName(fileName) ?? 'file'})`
+            attachment = { kind: 'file', file_id: `${msgId}:${fileKey}:file`, name: safeName(fileName) }
+            break
+          }
+          case 'audio': {
+            const fileKey = parsedContent['file_key'] as string | undefined
+            if (!fileKey) return
+            text = '(voice message)'
+            attachment = { kind: 'audio', file_id: `${msgId}:${fileKey}:file` }
+            break
+          }
+          case 'media': {
+            // video
+            const fileKey = parsedContent['file_key'] as string | undefined
+            const fileName = parsedContent['file_name'] as string | undefined
+            if (!fileKey) return
+            text = '(video)'
+            attachment = { kind: 'video', file_id: `${msgId}:${fileKey}:file`, name: safeName(fileName) }
+            break
+          }
+          case 'sticker': {
+            text = '(sticker)'
+            break
+          }
+          case 'post': {
+            // Rich text
+            text = extractRichText(parsedContent as Record<string, RichTextLang>)
+            if (!text) text = '(rich text message)'
+            break
+          }
+          default:
+            return
+        }
+
+        await handleInbound(senderId, chatId, chatType, msgId, ts, text, mentions, imagePath, attachment)
+      } catch (err) {
+        process.stderr.write(`feishu channel: handler error: ${err}\n`)
+      }
     },
   }),
+}).catch(err => {
+  process.stderr.write(`feishu channel: WSClient failed: ${err}\n`)
 })
 
 // ── Fetch bot open_id for mention detection ───────────────────────────────────
 void (async () => {
   try {
-    // Use the lark SDK to fetch bot info
-    const res = await (feishu as unknown as {
-      request: (opts: { method: string; url: string }) => Promise<{
-        data?: { bot?: { open_id?: string; app_name?: string } }
-      }>
-    }).request({
-      method: 'GET',
-      url: '/open-apis/bot/v3/info',
+    const res = await fetch('https://open.feishu.cn/open-apis/bot/v3/info', {
+      headers: { Authorization: `Bearer ${await getTenantToken()}` },
     })
-    botOpenId = res.data?.bot?.open_id ?? ''
-    const name = res.data?.bot?.app_name ?? appId
+    const body = await res.json() as { bot?: { open_id?: string; app_name?: string } }
+    botOpenId = body.bot?.open_id ?? ''
+    const name = body.bot?.app_name ?? appId
     process.stderr.write(`feishu channel: connected as ${name} (${botOpenId})\n`)
   } catch (err) {
     process.stderr.write(`feishu channel: could not fetch bot info: ${err}\n`)
   }
 })()
+
+// Fetch a tenant_access_token for raw API calls the SDK doesn't cover.
+async function getTenantToken(): Promise<string> {
+  const res = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+  })
+  const body = await res.json() as { tenant_access_token?: string }
+  return body.tenant_access_token ?? ''
+}

@@ -1,10 +1,12 @@
 {
   "name": "claude-channel-feishu",
   "version": "1.0.0",
+  "license": "Apache-2.0",
+  "type": "module",
   "description": "Feishu (飞书) channel plugin for Claude Code",
-  "main": "server.ts",
+  "bin": "./server.ts",
   "scripts": {
-    "start": "bun server.ts"
+    "start": "bun install --no-summary && bun server.ts"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.30.0",
